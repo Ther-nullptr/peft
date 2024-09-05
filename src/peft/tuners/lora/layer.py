@@ -27,6 +27,7 @@ from transformers.pytorch_utils import Conv1D
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 from peft.utils.integrations import dequantize_module_weight, gather_params_ctx, get_bnb_param_type
 from peft.utils.other import transpose
+from peft.import_utils import is_bnb_4bit_available, is_bnb_available
 
 from .config import LoraConfig
 from .dora import DoraConv2dLayer, DoraEmbeddingLayer, DoraLinearLayer
@@ -127,12 +128,18 @@ class LoraLayer(BaseTunerLayer):
         if isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
             with gather_params_ctx(self.get_base_layer().weight):
                 self.pissa_init(adapter_name, init_lora_weights)
+        elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("qpissa"):
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.qpissa_init(adapter_name, init_lora_weights)
         elif isinstance(init_lora_weights, str) and init_lora_weights.lower() == "olora":
             with gather_params_ctx(self.get_base_layer().weight):
                 self.olora_init(adapter_name)
         elif init_lora_weights == "loftq":
             with gather_params_ctx(self.get_base_layer().weight):
                 self.loftq_init(adapter_name)
+        elif init_lora_weights == "qloftq":
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.qloftq_init(adapter_name)
         elif init_lora_weights:
             self.reset_lora_parameters(adapter_name, init_lora_weights)
         # call this before dora_init
@@ -245,6 +252,45 @@ class LoraLayer(BaseTunerLayer):
         weight = weight.data - self.scaling[adapter_name] * lora_B @ lora_A
         weight = weight.to(dtype)
         self.get_base_layer().weight.data = weight
+        
+    def qpissa_init(self, adapter_name, init_lora_weights):
+        if is_bnb_available():
+            import bitsandbytes as bnb
+        else:
+            raise ValueError("bitsandbytes is not available, please install it to use LoftQ.")
+        
+        qweight, quant_state, quant_type = self.get_base_layer().weight, self.get_base_layer().quant_state, self.get_base_layer().weight.quant_type # get quantized weight from the base layer
+        dtype = self.get_base_layer().compute_dtype
+        weight = bnb.functional.dequantize_4bit(qweight, quant_state, quant_type=quant_type)
+        weight = weight.to(device="cuda", dtype=torch.float32)
+
+        if init_lora_weights == "qpissa":
+            # USV^T = W <-> VSU^T = W^T, where W^T = weight.data in R^{out_channel, in_channel},
+            V, S, Uh = torch.linalg.svd(weight.data, full_matrices=False)
+            Vr = V[:, : self.r[adapter_name]]
+            Sr = S[: self.r[adapter_name]]
+            Sr /= self.scaling[adapter_name]
+            Uhr = Uh[: self.r[adapter_name]]
+        elif len(init_lora_weights.split("_niter_")) == 2:
+            Vr, Sr, Ur = svd_lowrank(
+                weight.data, self.r[adapter_name], niter=int(init_lora_weights.split("_niter_")[-1])
+            )
+            Sr /= self.scaling[adapter_name]
+            Uhr = Ur.t()
+        else:
+            raise ValueError(
+                f"init_lora_weights should be 'qpissa' or 'qpissa_niter_[number of iters]', got {init_lora_weights} instead."
+            )
+
+        lora_A = torch.diag(torch.sqrt(Sr)) @ Uhr
+        lora_B = Vr @ torch.diag(torch.sqrt(Sr))
+        self.lora_A[adapter_name].weight.data = lora_A
+        self.lora_B[adapter_name].weight.data = lora_B
+        weight = weight.data - self.scaling[adapter_name] * lora_B @ lora_A
+        weight = weight.to(dtype)
+        qweight, quant_state = bnb.functional.quantize_4bit(weight, quant_type=quant_type)
+        self.get_base_layer().weight.data = qweight
+        self.get_base_layer().quant_state = quant_state
 
     def loftq_init(self, adapter_name):
         from peft.utils.loftq_utils import loftq_init
@@ -266,6 +312,39 @@ class LoraLayer(BaseTunerLayer):
             self.lora_embedding_A[adapter_name].weight.data = lora_A
             self.lora_embedding_B[adapter_name].weight.data = lora_B
         self.get_base_layer().weight.data = qweight
+        
+    def qloftq_init(self, adapter_name):
+        from peft.utils.loftq_utils import loftq_init
+        if is_bnb_available():
+            import bitsandbytes as bnb
+        else:
+            raise ValueError("bitsandbytes is not available, please install it to use LoftQ.")
+
+        qweight, quant_state, quant_type = self.get_base_layer().weight, self.get_base_layer().quant_state, self.get_base_layer().weight.quant_type # get quantized weight from the base layer
+        dtype = self.get_base_layer().compute_dtype
+        weight = bnb.functional.dequantize_4bit(qweight, quant_state, quant_type=quant_type)
+        weight = weight.to(device="cuda", dtype=torch.float32)
+        
+        kwargs = {
+            "num_bits": self.kwargs.get("loftq_bits", 4),
+            "reduced_rank": self.r[adapter_name],
+            "num_iter": self.kwargs.get("loftq_iter", 1),
+        }
+
+        qweight, lora_A, lora_B = loftq_init(weight, **kwargs)
+        if adapter_name in self.lora_A.keys():
+            # initialize A the same way as the default for nn.Linear and B to zero
+            self.lora_A[adapter_name].weight.data = lora_A
+            self.lora_B[adapter_name].weight.data = lora_B
+        if adapter_name in self.lora_embedding_A.keys():
+            # initialize a the same way as the default for nn.linear and b to zero
+            self.lora_embedding_A[adapter_name].weight.data = lora_A
+            self.lora_embedding_B[adapter_name].weight.data = lora_B
+            
+        weight = weight.to(dtype)
+        qweight, quant_state = bnb.functional.quantize_4bit(weight, quant_type=quant_type)
+        self.get_base_layer().weight.data = qweight
+        self.get_base_layer().quant_state = quant_state
 
     def dora_init(self, adapter_name: str) -> None:
         if not self.lora_magnitude_vector:
