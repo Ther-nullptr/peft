@@ -259,7 +259,7 @@ class LoraLayer(BaseTunerLayer):
         else:
             raise ValueError("bitsandbytes is not available, please install it to use LoftQ.")
         
-        qweight, quant_state, quant_type = self.get_base_layer().weight, self.get_base_layer().quant_state, self.get_base_layer().weight.quant_type # get quantized weight from the base layer
+        qweight, quant_state, quant_type = self.get_base_layer().weight, self.get_base_layer().weight.quant_state, self.get_base_layer().weight.quant_type # get quantized weight from the base layer
         dtype = self.get_base_layer().compute_dtype
         weight = bnb.functional.dequantize_4bit(qweight, quant_state, quant_type=quant_type)
         weight = weight.to(device="cuda", dtype=torch.float32)
@@ -290,7 +290,8 @@ class LoraLayer(BaseTunerLayer):
         weight = weight.to(dtype)
         qweight, quant_state = bnb.functional.quantize_4bit(weight, quant_type=quant_type)
         self.get_base_layer().weight.data = qweight
-        self.get_base_layer().quant_state = quant_state
+        self.get_base_layer().weight.quant_state = quant_state
+        self.get_base_layer().weight.quant_type = quant_type
 
     def loftq_init(self, adapter_name):
         from peft.utils.loftq_utils import loftq_init
